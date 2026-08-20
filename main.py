@@ -81,7 +81,35 @@ class Application:
                             capture_mgr.save(frame, det, draw_func=draw_fn)
                             captured_count += 1
 
-                    if frame_idx % 30 == 0:
+                    if cfg["video"]["preview"]:
+                        # 重要：必须copy，否则修改原始帧
+                        preview_frame = frame.copy()
+
+                        # =====先绘制ROI红色多边形（先画底层）=====
+                        roi_cfg = cfg.get("roi", {})
+                        if roi_cfg.get("enabled", False):
+                            h, w = preview_frame.shape[:2]
+                            roi_points = np.array([
+                                (int(p[0] * w), int(p[1] * h))
+                                for p in roi_cfg["points"]
+                            ], dtype=np.int32)
+                            # 修正：cv2.polylines要求 [[[x,y],[x,y]]] 三维数组格式
+                            roi_points = roi_points.reshape((-1, 1, 2))
+                            cv2.polylines(preview_frame, [roi_points], isClosed=True, color=(0, 0, 255), thickness=3)
+
+                        # =====再绘制人物检测绿框（上层，盖在ROI上面）=====
+                        if cfg["capture"]["save_with_bbox"]:
+                            preview_frame = detector.draw_boxes(preview_frame, detections)
+
+                        cv2.imshow("Video Preview", preview_frame)
+                        # 必须waitKey，窗口才刷新，按q退出当前视频
+                        key = cv2.waitKey(1) & 0xFF
+                        if key == ord('q'):
+                            print("[App] 按下q，终止处理")
+                            self.running = False
+                            break
+                    # ==========新增预览窗口代码结束==========
+                    if frame_idx % 500 == 0:
                         print(f"[{video_path.name}] 帧 #{frame_idx}, 检测到 {len(detections)} 人, 本次截图 {captured_count} 张")
             print(f"✅ 视频处理完成: {video_path.name}")
             return True
