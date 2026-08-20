@@ -137,3 +137,16 @@ class CaptureManager:
         else:
             print(f"[Capture] ❌ 保存失败: {filepath}")
             return None
+
+    def _check_roi(self, center: tuple, roi_config: dict, frame_shape: tuple) -> bool:
+        """判断检测中心点是否在 ROI 多边形内"""
+        if not roi_config.get("enabled", False):
+            return True  # ROI未启用 → 全部放行，全屏检测
+        # 将配置的0‑1相对坐标换算成实际像素坐标
+        h, w = frame_shape[:2]
+        points = np.array([
+            (int(p[0] * w), int(p[1] * h))
+            for p in roi_config["points"]
+        ], dtype=np.int32)
+        # 判断人物框中心点是否在多边形内部
+        return cv2.pointPolygonTest(points, center, False) >= 0

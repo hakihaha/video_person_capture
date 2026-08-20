@@ -12,6 +12,7 @@ from pathlib import Path
 from detector import PersonDetector
 from capture_manager import CaptureManager
 from video_reader import VideoReader
+import numpy as np
 
 
 class Application:
@@ -51,6 +52,7 @@ class Application:
         print(f"   输出目录: {self.config['capture']['output_dir']}")
         print(f"   按 Ctrl+C 或 Q 键退出")
         print("=" * 50)
+        print("=" * 50)
 
         with VideoReader(source, resize_w, skip) as reader:
             for frame_idx, frame in reader:
@@ -79,10 +81,11 @@ class Application:
                             (int(p[0] * w), int(p[1] * h))
                             for p in roi_cfg["points"]
                         ]
-                        pts_array = [pts]
+                        # 关键修复：转为np.int32，适配OpenCV5.0
+                        pts_array = [np.array(pts, dtype=np.int32)]
                         cv2.polylines(vis, pts_array, True, (0, 0, 255), 2)
                         cv2.putText(vis, "ROI", (pts[0][0], pts[0][1] - 5),
-                                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
 
                     # 状态信息叠加
                     status_text = f"Frame: {frame_idx} | Persons: {len(detections)} | Captured: {captured_count}"
