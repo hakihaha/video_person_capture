@@ -25,6 +25,10 @@ class PersonDetector:
         self.model = YOLO(model_path)
         self.model.to(device)
         self.device = device
+        # GPU启用FP16半精度，消除half参数废弃警告
+        if device.startswith("cuda"):
+            self.model.model.half()
+        self.device = device
 
         # 模型预热（消除首次推理延迟）
         dummy = torch.zeros(1, 3, 640, 640).to(device)
