@@ -18,6 +18,7 @@ detection:
 
 # 固定视角 ROI（感兴趣区域）
 # 只检测多边形区域内的人，减少误检测
+# 启用后先裁剪 ROI 外接矩形再送模型，坐标自动映射回原图
 roi:
   enabled: true
   points:                       # 多边形顶点，相对坐标 [x, y]，范围 0.0~1.0
@@ -28,7 +29,7 @@ roi:
 
 # 截图策略
 capture:
-  output_dir: "D:\\0801_0807"        # 截图保存根目录
+  output_dir: "D:\\0814_0817"        # 截图保存根目录
   interval_seconds: 2.0         # 同区域最小截图间隔（秒），用于去重
   min_person_height_px: 80      # 人物框最小高度（像素），过滤远景小人/误检
   save_with_bbox: true          # 截图是否画上检测框和置信度
@@ -37,15 +38,29 @@ capture:
 # 视频处理参数
 video:
   resize_width: 960            # 处理分辨率宽度（降低可加速），设为 0 保持原分辨率
-  skip_frames: 24                # 跳帧数，0=每帧都检测，1=每2帧检测一次
-  preview: false                 # 是否显示实时预览窗口（生产环境可设为 false）
+  skip_frames: 24                # 基础跳帧数，0=每帧都检测，1=每2帧检测一次
+  preview: true                # 是否显示实时预览窗口（生产环境建议 false）
+  # 动态自适应跳帧（夜间空场景优化）
+  # 连续N批无人检测 → 逐步拉大跳帧（×multiplier），上限 max_skip
+  # 一旦检出人 → 立即回退到基础 skip_frames
+  dynamic_skip:
+    enabled: true
+    no_person_threshold: 5       # 连续N批无人后开始拉大跳帧
+    sparse_multiplier: 2.0       # 每达到一次阈值，跳帧数×此系数（24→48→96→...）
+    max_skip: 50                # 跳帧绝对上限（25fps下约2秒检测一次，防止漏检）
+
+# 结构化输出
+# 每个视频生成一份 JSON 结果文件，含人员事件 + 无人段 + 统计摘要
+result:
+  enabled: true
+  output_dir: "./results"        # 结构化结果保存目录
 
 # ==============================================
 # 批量任务配置（递归扫描视频文件夹 + 断点续跑）
 # ==============================================
 batch_task:
   # 视频扫描根目录，会递归遍历所有嵌套子文件夹
-  scan_video_root: "D:\\视频\\监控"
+  scan_video_root: "D:\\190准备室"
   # 断点任务状态保存文件路径
   task_status_file: "./task_status.json"
   # 识别的视频后缀

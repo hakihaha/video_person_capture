@@ -1,6 +1,6 @@
 """
 固定视角视频人物检测抓拍系统 - 主程序
-【批量递归遍历 + 断点续跑 + 批量推理 + 多进程并行】
+【批量递归遍历 + 断点续跑 + 批量推理 + 多进程并行 + ROI裁剪 + 动态跳帧 + 结构化输出】
 所有批量路径配置统一放在 config.yaml -> batch_task
 """
 import yaml
@@ -8,12 +8,110 @@ import cv2
 import signal
 import json
 import copy
+import math
 import multiprocessing
 from pathlib import Path
 from detector import PersonDetector
 from capture_manager import CaptureManager
 from video_reader import VideoReader
+from result_recorder import ResultRecorder
 import numpy as np
+
+
+# ============================================================
+#  ROI 裁剪辅助函数
+# ============================================================
+
+def _compute_roi_crop(roi_cfg: dict, frame_shape: tuple) -> tuple | None:
+    """
+    计算 ROI 多边形的外接矩形，用于裁剪后送模型推理。
+    裁剪后只检测局部区域，大幅减少计算量。
+
+    Returns:
+        (x1, y1, x2, y2) 像素坐标，或 None（ROI 未启用/区域过小）
+    """
+    if not roi_cfg.get("enabled", False):
+        return None
+
+    h, w = frame_shape[:2]
+    points = roi_cfg["points"]
+    xs = [int(p[0] * w) for p in points]
+    ys = [int(p[1] * h) for p in points]
+    x1, x2 = min(xs), max(xs)
+    y1, y2 = min(ys), max(ys)
+
+    # 边界约束
+    x1 = max(0, x1)
+    y1 = max(0, y1)
+    x2 = min(w, x2)
+    y2 = min(h, y2)
+
+    # 区域过小则不裁剪
+    if x2 - x1 < 32 or y2 - y1 < 32:
+        return None
+
+    return (x1, y1, x2, y2)
+
+
+def _map_detections_back(detections: list[dict], offset_x: int, offset_y: int):
+    """将裁剪后检测到的坐标映射回原始全画面坐标"""
+    for det in detections:
+        x1, y1, x2, y2 = det["bbox"]
+        det["bbox"] = (x1 + offset_x, y1 + offset_y,
+                       x2 + offset_x, y2 + offset_y)
+        cx, cy = det["center"]
+        det["center"] = (cx + offset_x, cy + offset_y)
+        # height 不变
+
+
+# ============================================================
+#  动态自适应跳帧控制器
+# ============================================================
+
+class SkipController:
+    """
+    动态自适应跳帧：
+      - 正常态：按 base_skip 间隔检测
+      - 连续 N 批无人 → 逐步拉大跳帧（×multiplier），上限 max_skip
+      - 检出人 → 立即回退到 base_skip
+    """
+
+    def __init__(self, base_skip: int, no_person_threshold: int = 5,
+                 sparse_multiplier: float = 2.0, max_skip: int = 100):
+        self.base_skip = base_skip
+        self.threshold = max(1, no_person_threshold)
+        self.multiplier = max(1.0, sparse_multiplier)
+        self.max_skip = max_skip
+        self.consecutive_empty = 0
+        self.current_skip = base_skip
+
+    def update(self, person_detected: bool) -> int:
+        """
+        每批推理后调用，返回当前应使用的 skip 值。
+
+        Args:
+            person_detected: 本批是否检出人员
+
+        Returns:
+            更新后的 skip 值
+        """
+        if person_detected:
+            self.consecutive_empty = 0
+            self.current_skip = self.base_skip
+        else:
+            self.consecutive_empty += 1
+            if self.consecutive_empty >= self.threshold:
+                levels = self.consecutive_empty // self.threshold
+                self.current_skip = min(
+                    int(self.base_skip * (self.multiplier ** levels)),
+                    self.max_skip
+                )
+        return self.current_skip
+
+    def reset(self):
+        """新视频时重置"""
+        self.consecutive_empty = 0
+        self.current_skip = self.base_skip
 
 
 # ============================================================
@@ -55,13 +153,41 @@ def _save_status_locked(path: str, vid_key: str, entry: dict, lock):
             json.dump(status, f, ensure_ascii=False, indent=2)
 
 
-def _flush_batch_worker(worker_id, detector, capture_mgr, frame_buffer,
-                        video_name, roi_cfg, vid_key, task_status_path, lock):
-    """多进程 worker 内部：处理一批帧的检测和截图"""
-    frames = [item[1] for item in frame_buffer]
-    all_detections = detector.detect_batch(frames)
+def _process_batch(frames, detections_per_frame, frame_metas,
+                   capture_mgr, detector, roi_cfg, roi_crop,
+                   recorder, video_name, log_prefix,
+                   vid_key, task_status_path, lock,
+                   is_multiprocess: bool) -> bool:
+    """
+    处理一批帧的检测结果：截图保存 + 结构化记录 + 日志 + 状态保存。
+    单进程和多进程共用此逻辑。
 
-    for (frame_idx, frame, pos_msec), detections in zip(frame_buffer, all_detections):
+    Args:
+        frames: 原始帧列表（用于截图保存和预览）
+        detections_per_frame: 每帧的检测结果列表（已映射回原图坐标）
+        frame_metas: [(frame_idx, pos_msec), ...]
+        capture_mgr: 截图管理器
+        detector: 检测器（用于 draw_boxes）
+        roi_cfg: ROI 配置
+        roi_crop: ROI 裁剪区域 (x1,y1,x2,y2) 或 None
+        recorder: 结果记录器或 None
+        video_name: 视频名
+        log_prefix: 日志前缀（如 "[App]" 或 "[W0]"）
+        vid_key: 视频标识
+        task_status_path: 状态文件路径
+        lock: 多进程锁（单进程传 None）
+        is_multiprocess: 是否多进程模式
+
+    Returns:
+        本批是否检出人员
+    """
+    person_found = False
+
+    for frame, detections, (frame_idx, pos_msec) in zip(frames, detections_per_frame, frame_metas):
+        # 结构化记录
+        if recorder:
+            recorder.record(frame_idx, pos_msec, detections)
+
         captured_count = 0
         for det in detections:
             if capture_mgr.should_capture(det, frame.shape, roi_cfg, pos_msec):
@@ -70,10 +196,35 @@ def _flush_batch_worker(worker_id, detector, capture_mgr, frame_buffer,
                                  video_name=video_name, video_pos_msec=pos_msec)
                 captured_count += 1
 
+        if detections:
+            person_found = True
+
         if frame_idx % 500 == 0:
-            print(f"[W{worker_id}] 帧 #{frame_idx}, 检测 {len(detections)} 人, 截图 {captured_count}")
-            _save_status_locked(task_status_path, vid_key,
-                                {"status": "in_progress", "frame": frame_idx}, lock)
+            skip_info = ""
+            print(f"{log_prefix} 帧 #{frame_idx}, 检测 {len(detections)} 人, 截图 {captured_count}{skip_info}")
+            if is_multiprocess and lock:
+                _save_status_locked(task_status_path, vid_key,
+                                    {"status": "in_progress", "frame": frame_idx}, lock)
+
+    return person_found
+
+
+def _detect_with_roi(detector, frames, roi_crop):
+    """
+    ROI 裁剪后批量推理，坐标映射回原图。
+
+    Returns:
+        list[list[dict]]: 每帧检测结果（坐标已映射到原图）
+    """
+    if roi_crop:
+        ox, oy, ex, ey = roi_crop
+        crop_frames = [f[oy:ey, ox:ex] for f in frames]
+        all_detections = detector.detect_batch(crop_frames)
+        for dets in all_detections:
+            _map_detections_back(dets, ox, oy)
+        return all_detections
+    else:
+        return detector.detect_batch(frames)
 
 
 def _worker_main(worker_id: int, config: dict, video_tasks: list,
@@ -96,44 +247,110 @@ def _worker_main(worker_id: int, config: dict, video_tasks: list,
 
     batch_size = config.get("detection", {}).get("batch_size", 8)
     resize_w = config["video"]["resize_width"]
-    skip = config["video"]["skip_frames"]
+    base_skip = config["video"]["skip_frames"]
     roi_cfg = config.get("roi", {})
+
+    # 动态跳帧配置
+    ds_cfg = config.get("video", {}).get("dynamic_skip", {})
+    skip_ctrl = None
+    if ds_cfg.get("enabled", False):
+        skip_ctrl = SkipController(
+            base_skip=base_skip,
+            no_person_threshold=ds_cfg.get("no_person_threshold", 5),
+            sparse_multiplier=ds_cfg.get("sparse_multiplier", 2.0),
+            max_skip=ds_cfg.get("max_skip", 100),
+        )
+
+    # 结构化输出配置
+    result_cfg = config.get("result", {})
+    result_enabled = result_cfg.get("enabled", False)
+    result_dir = result_cfg.get("output_dir", "./results")
+
+    log_tag = f"[W{worker_id}]"
 
     for vid_key, video_path_str, start_frame in video_tasks:
         video_name = Path(video_path_str).stem
         capture_mgr.reset_dedup()
+        if skip_ctrl:
+            skip_ctrl.reset()
         last_frame = start_frame
+
+        # 初始化结果记录器
+        recorder = None
+        if result_enabled:
+            recorder = ResultRecorder(video_name, video_path_str)
+
+        # 计算当前视频的 skip（动态跳帧可能修改）
+        current_skip = base_skip if not skip_ctrl else skip_ctrl.current_skip
 
         try:
             frame_buffer = []
-            with VideoReader(video_path_str, resize_w, skip, start_frame) as reader:
+            frame_metas = []
+            with VideoReader(video_path_str, resize_w, current_skip, start_frame) as reader:
+                if recorder:
+                    recorder.fps = reader.fps
+
+                # ROI 裁剪区域（从第一帧的形状计算，同视频内不变）
+                roi_crop = None
+
                 for frame_idx, frame in reader:
                     pos_msec = reader.pos_msec
-                    frame_buffer.append((frame_idx, frame, pos_msec))
+                    frame_buffer.append(frame)
+                    frame_metas.append((frame_idx, pos_msec))
                     last_frame = frame_idx
 
+                    # 第一帧时计算 ROI 裁剪区域
+                    if roi_crop is None and roi_cfg.get("enabled", False):
+                        roi_crop = _compute_roi_crop(roi_cfg, frame.shape)
+                        if roi_crop:
+                            print(f"{log_tag} ROI 裁剪: {roi_crop[0]},{roi_crop[1]} → {roi_crop[2]},{roi_crop[3]} "
+                                  f"(原图 {frame.shape[1]}x{frame.shape[0]})")
+
                     if len(frame_buffer) >= batch_size:
-                        _flush_batch_worker(worker_id, detector, capture_mgr, frame_buffer,
-                                            video_name, roi_cfg, vid_key, task_status_path, lock)
+                        all_detections = _detect_with_roi(detector, frame_buffer, roi_crop)
+                        person_found = _process_batch(
+                            frame_buffer, all_detections, frame_metas,
+                            capture_mgr, detector, roi_cfg, roi_crop,
+                            recorder, video_name, log_tag,
+                            vid_key, task_status_path, lock, is_multiprocess=True)
+
+                        # 动态跳帧
+                        if skip_ctrl:
+                            new_skip = skip_ctrl.update(person_found)
+                            if new_skip != reader.skip:
+                                reader.set_skip(new_skip)
+                                print(f"{log_tag} 跳帧调整: {reader.skip} → {new_skip}")
+
                         frame_buffer.clear()
+                        frame_metas.clear()
 
                 # 处理剩余帧
                 if frame_buffer:
-                    _flush_batch_worker(worker_id, detector, capture_mgr, frame_buffer,
-                                        video_name, roi_cfg, vid_key, task_status_path, lock)
+                    all_detections = _detect_with_roi(detector, frame_buffer, roi_crop)
+                    _process_batch(
+                        frame_buffer, all_detections, frame_metas,
+                        capture_mgr, detector, roi_cfg, roi_crop,
+                        recorder, video_name, log_tag,
+                        vid_key, task_status_path, lock, is_multiprocess=True)
                     frame_buffer.clear()
+                    frame_metas.clear()
+
+            # 保存结构化结果
+            if recorder:
+                result_path = Path(result_dir) / f"{video_name}.json"
+                recorder.save(str(result_path))
 
             _save_status_locked(task_status_path, vid_key,
                                 {"status": "done", "frame": 0}, lock)
-            print(f"[Worker-{worker_id}] 完成: {Path(video_path_str).name}")
+            print(f"{log_tag} 完成: {Path(video_path_str).name}")
 
         except KeyboardInterrupt:
-            print(f"[Worker-{worker_id}] 收到中断信号，保存进度后退出")
+            print(f"{log_tag} 收到中断信号，保存进度后退出")
             _save_status_locked(task_status_path, vid_key,
                                 {"status": "in_progress", "frame": last_frame}, lock)
             break
         except Exception as e:
-            print(f"[Worker-{worker_id}] 异常: {Path(video_path_str).name}: {e}")
+            print(f"{log_tag} 异常: {Path(video_path_str).name}: {e}")
             import traceback
             traceback.print_exc()
             _save_status_locked(task_status_path, vid_key,
@@ -162,6 +379,22 @@ class Application:
         # 并发与批量参数
         self.num_workers = bt_cfg.get("num_workers", 1)
         self.batch_size = self.config.get("detection", {}).get("batch_size", 8)
+
+        # 动态跳帧配置
+        ds_cfg = self.config.get("video", {}).get("dynamic_skip", {})
+        self.skip_ctrl = None
+        if ds_cfg.get("enabled", False):
+            self.skip_ctrl = SkipController(
+                base_skip=self.config["video"]["skip_frames"],
+                no_person_threshold=ds_cfg.get("no_person_threshold", 5),
+                sparse_multiplier=ds_cfg.get("sparse_multiplier", 2.0),
+                max_skip=ds_cfg.get("max_skip", 100),
+            )
+
+        # 结构化输出配置
+        result_cfg = self.config.get("result", {})
+        self.result_enabled = result_cfg.get("enabled", False)
+        self.result_dir = result_cfg.get("output_dir", "./results")
 
         # 单进程模式才在主进程加载模型；多进程模式由 worker 各自加载
         if self.num_workers <= 1:
@@ -210,14 +443,14 @@ class Application:
         video_list = sorted(video_list)
         return video_list
 
-    # ==================== 单进程批量推理 ====================
+    # ==================== 单进程模式 ====================
 
     def process_one_video(self, video_path: Path, vid_key: str, task_status: dict) -> bool:
-        """处理单个视频文件（批量推理版），返回True成功；False失败/中断"""
+        """处理单个视频文件（批量推理 + ROI裁剪 + 动态跳帧 + 结构化输出）"""
         cfg = self.config.copy()
         cfg["video_source"] = str(video_path.absolute())
         resize_w = cfg["video"]["resize_width"]
-        skip = cfg["video"]["skip_frames"]
+        base_skip = cfg["video"]["skip_frames"]
         roi_cfg = cfg.get("roi", {})
         video_name = video_path.stem
 
@@ -225,44 +458,98 @@ class Application:
         entry = task_status.get(vid_key, {})
         start_frame = entry.get("frame", 0) if isinstance(entry, dict) else 0
 
-        # 重置去重状态
+        # 重置状态
         self.capture_mgr.reset_dedup()
+        if self.skip_ctrl:
+            self.skip_ctrl.reset()
         last_frame = start_frame
+
+        # 初始化结果记录器
+        recorder = None
+        if self.result_enabled:
+            recorder = ResultRecorder(video_name, str(video_path))
+
+        current_skip = base_skip if not self.skip_ctrl else self.skip_ctrl.current_skip
 
         try:
             frame_buffer = []
-            with VideoReader(cfg["video_source"], resize_w, skip, start_frame) as reader:
+            frame_metas = []
+            roi_crop = None  # 从第一帧计算
+
+            with VideoReader(cfg["video_source"], resize_w, current_skip, start_frame) as reader:
+                if recorder:
+                    recorder.fps = reader.fps
+
                 for frame_idx, frame in reader:
                     if not self.running:
                         task_status[vid_key] = {"status": "in_progress", "frame": last_frame}
                         self._save_task_status(task_status)
                         return False
 
-                    # 关键：在读下一帧之前捕获 pos_msec
                     pos_msec = reader.pos_msec
-                    frame_buffer.append((frame_idx, frame, pos_msec))
+                    frame_buffer.append(frame)
+                    frame_metas.append((frame_idx, pos_msec))
                     last_frame = frame_idx
+
+                    # 第一帧时计算 ROI 裁剪区域
+                    if roi_crop is None and roi_cfg.get("enabled", False):
+                        roi_crop = _compute_roi_crop(roi_cfg, frame.shape)
+                        if roi_crop:
+                            print(f"[App] ROI 裁剪: {roi_crop[0]},{roi_crop[1]} → {roi_crop[2]},{roi_crop[3]} "
+                                  f"(原图 {frame.shape[1]}x{frame.shape[0]})")
 
                     # 攒满一批再推理
                     if len(frame_buffer) >= self.batch_size:
-                        self._flush_batch_single(frame_buffer, video_name, roi_cfg,
-                                                 vid_key, task_status)
+                        all_detections = _detect_with_roi(self.detector, frame_buffer, roi_crop)
+                        person_found = _process_batch(
+                            frame_buffer, all_detections, frame_metas,
+                            self.capture_mgr, self.detector, roi_cfg, roi_crop,
+                            recorder, video_name, "[App]",
+                            vid_key, None, None, is_multiprocess=False)
+
+                        # 预览窗口（仅单进程模式）
+                        if self.config["video"]["preview"]:
+                            self._show_preview(frame_buffer[-1], all_detections[-1], roi_cfg)
+
+                        # 动态跳帧
+                        if self.skip_ctrl:
+                            new_skip = self.skip_ctrl.update(person_found)
+                            if new_skip != reader.skip:
+                                reader.set_skip(new_skip)
+                                print(f"[App] 跳帧调整: {reader.skip} → {new_skip}")
+
                         frame_buffer.clear()
+                        frame_metas.clear()
 
                 # 处理视频末尾剩余帧
                 if frame_buffer:
-                    self._flush_batch_single(frame_buffer, video_name, roi_cfg,
-                                             vid_key, task_status)
+                    all_detections = _detect_with_roi(self.detector, frame_buffer, roi_crop)
+                    _process_batch(
+                        frame_buffer, all_detections, frame_metas,
+                        self.capture_mgr, self.detector, roi_cfg, roi_crop,
+                        recorder, video_name, "[App]",
+                        vid_key, None, None, is_multiprocess=False)
+
+                    if self.config["video"]["preview"]:
+                        self._show_preview(frame_buffer[-1], all_detections[-1], roi_cfg)
+
                     frame_buffer.clear()
+                    frame_metas.clear()
 
             if not self.running:
                 task_status[vid_key] = {"status": "in_progress", "frame": last_frame}
                 self._save_task_status(task_status)
                 return False
 
+            # 保存结构化结果
+            if recorder:
+                result_path = Path(self.result_dir) / f"{video_name}.json"
+                recorder.save(str(result_path))
+
             print(f"[App] 视频处理完成: {video_path.name}")
             task_status[vid_key] = {"status": "done", "frame": 0}
             return True
+
         except Exception as e:
             print(f"[App] 处理视频异常 {video_path.name} : {str(e)}")
             import traceback
@@ -271,43 +558,24 @@ class Application:
             self._save_task_status(task_status)
             return False
 
-    def _flush_batch_single(self, frame_buffer, video_name, roi_cfg, vid_key, task_status):
-        """单进程模式：处理一批帧（检测 + 截图 + 预览 + 状态保存）"""
-        frames = [item[1] for item in frame_buffer]
-        all_detections = self.detector.detect_batch(frames)
-
-        for (frame_idx, frame, pos_msec), detections in zip(frame_buffer, all_detections):
-            captured_count = 0
-            for det in detections:
-                if self.capture_mgr.should_capture(det, frame.shape, roi_cfg, pos_msec):
-                    draw_fn = self.detector.draw_boxes if self.capture_mgr.save_with_bbox else None
-                    self.capture_mgr.save(frame, det, draw_func=draw_fn,
-                                         video_name=video_name, video_pos_msec=pos_msec)
-                    captured_count += 1
-
-            # 预览窗口（仅单进程模式）
-            if self.config["video"]["preview"]:
-                preview_frame = frame.copy()
-                if roi_cfg.get("enabled", False):
-                    h, w = preview_frame.shape[:2]
-                    roi_points = np.array([
-                        (int(p[0] * w), int(p[1] * h))
-                        for p in roi_cfg["points"]
-                    ], dtype=np.int32)
-                    roi_points = roi_points.reshape((-1, 1, 2))
-                    cv2.polylines(preview_frame, [roi_points], isClosed=True, color=(0, 0, 255), thickness=3)
-                if self.config["capture"]["save_with_bbox"]:
-                    preview_frame = self.detector.draw_boxes(preview_frame, detections)
-                cv2.imshow("Video Preview", preview_frame)
-                key = cv2.waitKey(1) & 0xFF
-                if key == ord('q'):
-                    print("[App] 按下q，终止处理")
-                    self.running = False
-
-            if frame_idx % 500 == 0:
-                print(f"[{video_name}] 帧 #{frame_idx}, 检测到 {len(detections)} 人, 本次截图 {captured_count} 张")
-                task_status[vid_key] = {"status": "in_progress", "frame": frame_idx}
-                self._save_task_status(task_status)
+    def _show_preview(self, frame, detections, roi_cfg):
+        """显示预览窗口（仅单进程模式）"""
+        preview_frame = frame.copy()
+        if roi_cfg.get("enabled", False):
+            h, w = preview_frame.shape[:2]
+            roi_points = np.array([
+                (int(p[0] * w), int(p[1] * h))
+                for p in roi_cfg["points"]
+            ], dtype=np.int32)
+            roi_points = roi_points.reshape((-1, 1, 2))
+            cv2.polylines(preview_frame, [roi_points], isClosed=True, color=(0, 0, 255), thickness=3)
+        if self.config["capture"]["save_with_bbox"]:
+            preview_frame = self.detector.draw_boxes(preview_frame, detections)
+        cv2.imshow("Video Preview", preview_frame)
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'):
+            print("[App] 按下q，终止处理")
+            self.running = False
 
     # ==================== 多进程模式 ====================
 
@@ -390,7 +658,12 @@ class Application:
         resume_count = len(to_process) - pending_count
 
         mode_label = f"多进程 x{self.num_workers}" if self.num_workers > 1 else "单进程"
-        print(f"[App] 运行模式: {mode_label} | 批量推理: batch_size={self.batch_size}")
+        features = [f"batch_size={self.batch_size}"]
+        if self.skip_ctrl:
+            features.append(f"动态跳帧(上限{self.skip_ctrl.max_skip})")
+        if self.result_enabled:
+            features.append("结构化输出")
+        print(f"[App] 运行模式: {mode_label} | {' + '.join(features)}")
         print(f"[App] 需要处理视频数量: {len(to_process)}（待处理 {pending_count}，续跑 {resume_count}）")
         print("=" * 60)
 
@@ -399,7 +672,7 @@ class Application:
             return
 
         if self.num_workers <= 1:
-            # ===== 单进程模式（兼容旧行为 + 批量推理）=====
+            # ===== 单进程模式（兼容旧行为 + 批量推理 + ROI + 动态跳帧）=====
             for idx, video_file in enumerate(to_process):
                 if not self.running:
                     break
