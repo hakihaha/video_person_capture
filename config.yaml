@@ -10,8 +10,8 @@ video_source: "D:\\190准备室\\3#厅 E190 D213准备室_20260818095724\\3#厅 
 detection:
   # 模型选择（由弱到强：n < s < m < l < x）
   # yolov8x.pt = 最精确但最慢，首次运行自动下载
-  model: "yolov8x.pt"
-  conf_threshold: 0.5           # 置信度阈值（0~1），越高误报越少
+  model: "yolov8n.pt"
+  conf_threshold: 0.30           # 置信度阈值（0~1），越高误报越少
   classes: [0]                  # 只检测 person（COCO 数据集中 0=person）
   device: "auto"                # auto=自动检测GPU/CPU，或指定 "cuda:0" / "cpu"
 
@@ -27,7 +27,7 @@ roi:
 
 # 截图策略
 capture:
-  output_dir: "D:\\截图2"        # 截图保存根目录
+  output_dir: "D:\\0801_0807"        # 截图保存根目录
   interval_seconds: 2.0         # 同区域最小截图间隔（秒），用于去重
   min_person_height_px: 80      # 人物框最小高度（像素），过滤远景小人/误检
   save_with_bbox: true          # 截图是否画上检测框和置信度
@@ -43,7 +43,7 @@ video:
 # ==============================================
 batch_task:
   # 视频扫描根目录，会递归遍历所有嵌套子文件夹
-  scan_video_root: "D:\\190准备室"
+  scan_video_root: "D:\\视频\\监控"
   # 断点任务状态保存文件路径
   task_status_file: "./task_status.json"
   # 识别的视频后缀

@@ -103,6 +103,7 @@ class Application:
 
         # 清理
         cv2.destroyAllWindows()
+        self.capture_mgr.close()
         print("[App] ✅ 已安全退出，所有资源已释放")
 
 

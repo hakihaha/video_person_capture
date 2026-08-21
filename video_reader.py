@@ -1,7 +1,7 @@
 """
 视频源读取器
 支持：本地视频文件、RTSP 网络流、USB 摄像头
-具备断线重连能力
+具备断线重连能力，支持从指定帧位置续读
 """
 
 import cv2
@@ -12,13 +12,21 @@ from pathlib import Path
 class VideoReader:
     """封装视频源读取，提供迭代器接口"""
 
-    def __init__(self, source, resize_width: int = 1280, skip_frames: int = 0):
+    def __init__(self, source, resize_width: int = 1280, skip_frames: int = 0, start_frame: int = 0):
         self.source = source
         self.resize_width = resize_width
         self.skip = skip_frames
+        self.start_frame = start_frame
         self._cap = None
         self._frame_count = 0
         self._is_file = False
+
+    @property
+    def pos_msec(self) -> float:
+        """当前帧在视频中的时间位置（毫秒）"""
+        if self._cap:
+            return self._cap.get(cv2.CAP_PROP_POS_MSEC)
+        return 0.0
 
     def __enter__(self):
         """上下文管理器进入"""
@@ -37,6 +45,12 @@ class VideoReader:
 
         # 减少缓冲区延迟（仅部分后端有效）
         self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+        # 从指定帧位置续读
+        if self.start_frame > 0:
+            self._cap.set(cv2.CAP_PROP_POS_FRAMES, self.start_frame)
+            self._frame_count = self.start_frame
+            print(f"[Video] 从第 {self.start_frame} 帧继续读取")
 
         # 打印源信息
         fps = self._cap.get(cv2.CAP_PROP_FPS)

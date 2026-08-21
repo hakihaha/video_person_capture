@@ -5,7 +5,6 @@
 import yaml
 import cv2
 import signal
-import sys
 import json
 from pathlib import Path
 from detector import PersonDetector
@@ -26,6 +25,10 @@ class Application:
         self.task_status_path = Path(bt_cfg["task_status_file"])
         self.video_suffix_set = set(bt_cfg["video_suffix"])
 
+        # 检测器和截图管理器全局复用，避免每个视频重新加载模型
+        self.detector = PersonDetector(self.config)
+        self.capture_mgr = CaptureManager(self.config)
+
         self.running = True
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
@@ -35,16 +38,30 @@ class Application:
         self.running = False
 
     def _load_task_status(self) -> dict:
-        """加载断点状态文件，不存在返回空字典"""
+        """加载断点状态文件，兼容旧格式（纯字符串 → {status, frame} 字典）"""
         if not self.task_status_path.exists():
             return {}
         with open(self.task_status_path, "r", encoding="utf-8") as f:
-            return json.load(f)
+            raw = json.load(f)
+        # 兼容旧格式：值为字符串时转换为字典
+        for key, val in raw.items():
+            if isinstance(val, str):
+                raw[key] = {"status": val, "frame": 0}
+        return raw
 
     def _save_task_status(self, status: dict):
         """保存任务状态到json"""
         with open(self.task_status_path, "w", encoding="utf-8") as f:
             json.dump(status, f, ensure_ascii=False, indent=2)
+
+    def _cleanup_task_status(self, status: dict, all_videos: list[Path]) -> dict:
+        """清理已不存在视频文件的无效任务记录"""
+        existing_keys = {str(p.absolute()) for p in all_videos}
+        cleaned = {k: v for k, v in status.items() if k in existing_keys}
+        removed = len(status) - len(cleaned)
+        if removed > 0:
+            print(f"[App] 清理了 {removed} 条无效任务记录（视频文件已不存在）")
+        return cleaned
 
     def _scan_all_video(self) -> list[Path]:
         """递归遍历根目录，找出全部视频文件（包含嵌套子文件夹）"""
@@ -55,72 +72,88 @@ class Application:
         video_list = sorted(video_list)
         return video_list
 
-    def process_one_video(self, video_path: Path):
+    def process_one_video(self, video_path: Path, vid_key: str, task_status: dict) -> bool:
         """处理单个视频文件，返回True成功；False失败/中断"""
         cfg = self.config.copy()
         cfg["video_source"] = str(video_path.absolute())
         resize_w = cfg["video"]["resize_width"]
         skip = cfg["video"]["skip_frames"]
         roi_cfg = cfg.get("roi", {})
+        video_name = video_path.stem
 
-        detector = PersonDetector(cfg)
-        capture_mgr = CaptureManager(cfg)
+        # 读取上次中断的帧位置
+        entry = task_status.get(vid_key, {})
+        start_frame = entry.get("frame", 0) if isinstance(entry, dict) else 0
+
+        # 重置去重状态
+        self.capture_mgr.reset_dedup()
+        last_frame = start_frame
 
         try:
-            with VideoReader(cfg["video_source"], resize_w, skip) as reader:
+            with VideoReader(cfg["video_source"], resize_w, skip, start_frame) as reader:
                 for frame_idx, frame in reader:
                     if not self.running:
-                        print("[App] 用户中断任务")
+                        task_status[vid_key] = {"status": "in_progress", "frame": last_frame}
+                        self._save_task_status(task_status)
                         return False
 
-                    detections = detector.detect(frame)
+                    last_frame = frame_idx
+                    detections = self.detector.detect(frame)
+                    pos_msec = reader.pos_msec
+
                     captured_count = 0
                     for det in detections:
-                        if capture_mgr.should_capture(det, frame.shape, roi_cfg):
-                            draw_fn = detector.draw_boxes if capture_mgr.save_with_bbox else None
-                            capture_mgr.save(frame, det, draw_func=draw_fn)
+                        if self.capture_mgr.should_capture(det, frame.shape, roi_cfg, pos_msec):
+                            draw_fn = self.detector.draw_boxes if self.capture_mgr.save_with_bbox else None
+                            self.capture_mgr.save(frame, det, draw_func=draw_fn,
+                                                 video_name=video_name, video_pos_msec=pos_msec)
                             captured_count += 1
 
                     if cfg["video"]["preview"]:
-                        # 重要：必须copy，否则修改原始帧
                         preview_frame = frame.copy()
 
-                        # =====先绘制ROI红色多边形（先画底层）=====
-                        roi_cfg = cfg.get("roi", {})
+                        # 先绘制ROI红色多边形（底层）
                         if roi_cfg.get("enabled", False):
                             h, w = preview_frame.shape[:2]
                             roi_points = np.array([
                                 (int(p[0] * w), int(p[1] * h))
                                 for p in roi_cfg["points"]
                             ], dtype=np.int32)
-                            # 修正：cv2.polylines要求 [[[x,y],[x,y]]] 三维数组格式
                             roi_points = roi_points.reshape((-1, 1, 2))
                             cv2.polylines(preview_frame, [roi_points], isClosed=True, color=(0, 0, 255), thickness=3)
 
-                        # =====再绘制人物检测绿框（上层，盖在ROI上面）=====
+                        # 再绘制人物检测绿框（上层）
                         if cfg["capture"]["save_with_bbox"]:
-                            preview_frame = detector.draw_boxes(preview_frame, detections)
+                            preview_frame = self.detector.draw_boxes(preview_frame, detections)
 
                         cv2.imshow("Video Preview", preview_frame)
-                        # 必须waitKey，窗口才刷新，按q退出当前视频
                         key = cv2.waitKey(1) & 0xFF
                         if key == ord('q'):
                             print("[App] 按下q，终止处理")
                             self.running = False
                             break
-                    # ==========新增预览窗口代码结束==========
+
                     if frame_idx % 500 == 0:
                         print(f"[{video_path.name}] 帧 #{frame_idx}, 检测到 {len(detections)} 人, 本次截图 {captured_count} 张")
+                        # 定期保存进度，支持视频内断点续跑
+                        task_status[vid_key] = {"status": "in_progress", "frame": frame_idx}
+                        self._save_task_status(task_status)
+
+            if not self.running:
+                task_status[vid_key] = {"status": "in_progress", "frame": last_frame}
+                self._save_task_status(task_status)
+                return False
+
             print(f"✅ 视频处理完成: {video_path.name}")
+            task_status[vid_key] = {"status": "done", "frame": 0}
             return True
         except Exception as e:
             print(f"❌ 处理视频异常 {video_path.name} : {str(e)}")
             import traceback
             traceback.print_exc()
+            task_status[vid_key] = {"status": "error", "frame": last_frame}
+            self._save_task_status(task_status)
             return False
-        finally:
-            del detector
-            del capture_mgr
 
     def run(self):
         print("=" * 60)
@@ -132,34 +165,39 @@ class Application:
             return
 
         task_status = self._load_task_status()
+        task_status = self._cleanup_task_status(task_status, all_videos)
 
         # 新增视频加入任务列表
         for vid in all_videos:
             vid_key = str(vid.absolute())
             if vid_key not in task_status:
-                task_status[vid_key] = "pending"
+                task_status[vid_key] = {"status": "pending", "frame": 0}
 
         self._save_task_status(task_status)
 
-        pending_list = [p for p in all_videos if task_status[str(p.absolute())] == "pending"]
-        print(f"[App] 需要处理视频数量: {len(pending_list)}，已完成直接跳过")
+        # 待处理 + 中断续跑的视频都需要执行
+        to_process = [p for p in all_videos
+                      if task_status[str(p.absolute())]["status"] in ("pending", "in_progress")]
+        pending_count = sum(1 for p in to_process
+                            if task_status[str(p.absolute())]["status"] == "pending")
+        resume_count = len(to_process) - pending_count
+        print(f"[App] 需要处理视频数量: {len(to_process)}（待处理 {pending_count}，续跑 {resume_count}）")
         print("=" * 60)
 
-        for idx, video_file in enumerate(pending_list):
+        for idx, video_file in enumerate(to_process):
             if not self.running:
                 break
             vid_key = str(video_file.absolute())
-            print(f"\n========= 任务进度 {idx+1}/{len(pending_list)} | {video_file.name} =========\n")
+            entry = task_status[vid_key]
+            start_frame = entry.get("frame", 0)
+            status_label = "续跑" if entry["status"] == "in_progress" else "处理"
+            print(f"\n========= 任务进度 {idx+1}/{len(to_process)} | {status_label}: {video_file.name} (从第 {start_frame} 帧) =========\n")
 
-            ok = self.process_one_video(video_file)
-            if ok:
-                task_status[vid_key] = "done"
-            else:
-                if self.running:
-                    task_status[vid_key] = "error"
+            self.process_one_video(video_file, vid_key, task_status)
             self._save_task_status(task_status)
 
         cv2.destroyAllWindows()
+        self.capture_mgr.close()
         if self.running:
             print("\n🎉 全部待处理视频执行完毕！")
         else:
