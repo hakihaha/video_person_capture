@@ -2,6 +2,8 @@
 .venv/
 venv/
 ENV/
+/.codely
+/.codely-cli/
 
 # ===== IDE配置文件 =====
 .idea/
@@ -37,3 +39,8 @@ task_status.json
 # ===== 配置（可选：config.yaml要不要提交？）=====
 # config.yaml 属于项目配置文件！！建议提交到仓库，不要忽略
 .workbuddy/memory/2026-08-21.md
+build/
+dist/
+
+# ===== PyInstaller 打包配方文件（每次打包自动生成） =====
+*.spec

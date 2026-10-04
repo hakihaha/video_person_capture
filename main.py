@@ -3,6 +3,8 @@
 【批量递归遍历 + 断点续跑 + 批量推理 + 多进程并行 + ROI裁剪 + 动态跳帧 + 结构化输出】
 所有批量路径配置统一放在 config.yaml -> batch_task
 """
+import os
+import sys
 import yaml
 import cv2
 import signal
@@ -16,6 +18,24 @@ from capture_manager import CaptureManager
 from video_reader import VideoReader
 from result_recorder import ResultRecorder
 import numpy as np
+
+
+# ============================================================
+#  打包路径工具：所有相对资源统一解析到 exe 所在目录
+#  本地运行时解析到源码目录；打包后解析到 exe 旁边
+# ============================================================
+
+def resource_path(rel: str) -> str:
+    """把相对路径解析到程序真实所在目录（打包/本地通用）"""
+    if not isinstance(rel, str) or not rel:
+        return rel
+    if os.path.isabs(rel):
+        return rel
+    if getattr(sys, "frozen", False):          # 打包成 exe 后
+        base = os.path.dirname(sys.executable)  # exe 所在目录
+    else:                                       # 本地 Python 调试
+        base = os.path.dirname(os.path.abspath(__file__))
+    return os.path.normpath(os.path.join(base, rel))
 
 
 # ============================================================
@@ -366,12 +386,19 @@ def _worker_main(worker_id: int, config: dict, video_tasks: list,
 
 class Application:
     def __init__(self, config_path: str = "config.yaml"):
-        config_full_path = Path(__file__).parent / config_path
+        config_full_path = resource_path(config_path)
         with open(config_full_path, "r", encoding="utf-8") as f:
             self.config = yaml.safe_load(f)
 
-        # 读取批量任务配置
+        # 打包后：把 config 里的相对路径统一解析到 exe 所在目录，
+        # 避免打包后工作目录不一致导致找不到模型/状态/结果
+        self.config["detection"]["model"] = resource_path(self.config["detection"]["model"])
+        self.config["result"]["output_dir"] = resource_path(self.config["result"]["output_dir"])
         bt_cfg = self.config["batch_task"]
+        bt_cfg["task_status_file"] = resource_path(bt_cfg["task_status_file"])
+        bt_cfg["scan_video_root"] = resource_path(bt_cfg["scan_video_root"])
+
+        # 读取批量任务配置
         self.scan_root = Path(bt_cfg["scan_video_root"])
         self.task_status_path = Path(bt_cfg["task_status_file"])
         self.video_suffix_set = set(bt_cfg["video_suffix"])
@@ -699,5 +726,6 @@ class Application:
 
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()  # 打包成 exe 后 Windows 多进程必需，必须最先执行
     app = Application()
     app.run()
